@@ -31,51 +31,134 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
 import com.google.android.gms.maps3d.GoogleMap3D
 import com.google.android.gms.maps3d.Map3DInitConfig
 import com.google.android.gms.maps3d.Map3DView
 import com.google.android.gms.maps3d.OnMap3DViewReadyCallback
 import com.google.android.gms.maps3d.model.Map3DMode
+import com.google.android.gms.maps3d.model.camera
+import com.google.android.gms.maps3d.model.latLngAltitude
 import java.util.Locale
 
-class MainActivity : ComponentActivity() {
+class MainActivity : ComponentActivity(), OnMap3DViewReadyCallback {
+    private lateinit var map3DView: Map3DView
+
+    private val mapState = mutableStateOf<GoogleMap3D?>(null)
+    private val mapReadyState = mutableStateOf(false)
+    private val mapErrorState = mutableStateOf<String?>(null)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
+        map3DView = Map3DView(this, createMapConfig())
+        map3DView.onCreate(savedInstanceState)
+
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
                 Surface(modifier = Modifier.fillMaxSize()) {
-                    GodsEyeScreen()
+                    GodsEyeScreen(
+                        map3DView = map3DView,
+                        map3D = mapState.value,
+                        mapReady = mapReadyState.value,
+                        mapError = mapErrorState.value,
+                    )
                 }
             }
         }
+
+        map3DView.getMap3DViewAsync(this)
+    }
+
+    override fun onMap3DViewReady(googleMap3D: GoogleMap3D) {
+        mapState.value = googleMap3D
+        mapReadyState.value = true
+        mapErrorState.value = null
+    }
+
+    override fun onError(error: Exception) {
+        mapReadyState.value = false
+        mapErrorState.value = error.message ?: error.javaClass.simpleName
+    }
+
+    override fun onStart() {
+        super.onStart()
+        if (::map3DView.isInitialized) map3DView.onStart()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (::map3DView.isInitialized) map3DView.onResume()
+    }
+
+    override fun onPause() {
+        if (::map3DView.isInitialized) map3DView.onPause()
+        super.onPause()
+    }
+
+    override fun onStop() {
+        if (::map3DView.isInitialized) map3DView.onStop()
+        super.onStop()
+    }
+
+    override fun onDestroy() {
+        mapState.value = null
+        if (::map3DView.isInitialized) map3DView.onDestroy()
+        super.onDestroy()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        if (::map3DView.isInitialized) map3DView.onSaveInstanceState(outState)
+    }
+
+    override fun onLowMemory() {
+        super.onLowMemory()
+        if (::map3DView.isInitialized) map3DView.onLowMemory()
     }
 }
 
+private fun createMapConfig(): Map3DInitConfig =
+    Map3DInitConfig.create(
+        centerLat = 52.1,
+        centerLng = 5.3,
+        centerAlt = 0.0,
+        heading = 0.0,
+        tilt = 45.0,
+        roll = 0.0,
+        range = 2_000_000.0,
+        minAltitude = 0.0,
+        maxAltitude = 63_170_000.0,
+        minHeading = 0.0,
+        maxHeading = 360.0,
+        minTilt = 0.0,
+        maxTilt = 90.0,
+        bounds = null,
+        mapMode = Map3DMode.HYBRID,
+        mapId = null,
+        language = Locale.getDefault().language,
+        region = Locale.getDefault().country,
+    )
+
 @Composable
-private fun GodsEyeScreen() {
-    var mapReady by remember { mutableStateOf(false) }
-    var mapError by remember { mutableStateOf<String?>(null) }
-    var map3D by remember { mutableStateOf<GoogleMap3D?>(null) }
+private fun GodsEyeScreen(
+    map3DView: Map3DView,
+    map3D: GoogleMap3D?,
+    mapReady: Boolean,
+    mapError: String?,
+) {
     var showLayers by remember { mutableStateOf(false) }
     var selected by remember { mutableStateOf<SelectedContact?>(null) }
-    var mapGeneration by remember { mutableStateOf(0) }
+    var diagnostics by remember { mutableStateOf("renderer initialiseren…") }
 
     val enabled = remember {
         mutableStateMapOf(
@@ -112,23 +195,18 @@ private fun GodsEyeScreen() {
         enabled.forEach { (layer, isEnabled) ->
             c.setEnabled(layer, isEnabled)
         }
+
+        while (true) {
+            diagnostics = c.diagnosticsText()
+            kotlinx.coroutines.delay(1_000L)
+        }
     }
 
     Box(modifier = Modifier.fillMaxSize()) {
-        key(mapGeneration) {
-            Map3DHost(
-                modifier = Modifier.fillMaxSize(),
-                onReady = {
-                    mapReady = true
-                    mapError = null
-                    map3D = it
-                },
-                onError = { error ->
-                    mapReady = false
-                    mapError = error.message ?: error.javaClass.simpleName
-                }
-            )
-        }
+        Map3DHost(
+            map3DView = map3DView,
+            modifier = Modifier.fillMaxSize(),
+        )
 
         Card(
             modifier = Modifier
@@ -160,6 +238,7 @@ private fun GodsEyeScreen() {
                     .padding(top = 92.dp, bottom = 88.dp, end = 10.dp),
                 enabled = enabled,
                 states = uiStates,
+                diagnostics = diagnostics,
                 onToggle = { layer, checked ->
                     enabled[layer] = checked
                     controller?.setEnabled(layer, checked)
@@ -190,14 +269,21 @@ private fun GodsEyeScreen() {
             horizontalArrangement = Arrangement.spacedBy(17.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            BottomChip("3D ↻") {
-                // Maps 3D 0.2.2 is Experimental Preview. If its camera renderer gets
-                // wedged, recreate the native view rather than leaving the user stuck.
-                mapReady = false
-                mapError = null
-                selected = null
-                map3D = null
-                mapGeneration += 1
+            BottomChip("🌍") {
+                map3D?.stopCameraAnimation()
+                map3D?.setCamera(
+                    camera {
+                        center = latLngAltitude {
+                            latitude = 22.0
+                            longitude = 8.0
+                            altitude = 0.0
+                        }
+                        heading = 0.0
+                        tilt = 0.0
+                        roll = 0.0
+                        range = 20_000_000.0
+                    }
+                )
             }
             BottomChip("LAYERS") { showLayers = !showLayers }
             BottomChip("UAP") { showLayers = true }
@@ -249,6 +335,7 @@ private fun LayerPanel(
     modifier: Modifier,
     enabled: Map<LiveLayerId, Boolean>,
     states: Map<LiveLayerId, LayerUiState>,
+    diagnostics: String,
     onToggle: (LiveLayerId, Boolean) -> Unit,
     onClose: () -> Unit,
 ) {
@@ -277,6 +364,11 @@ private fun LayerPanel(
                         "Native bronnen uit God's Eye View",
                         style = MaterialTheme.typography.bodySmall,
                         color = Color.Gray
+                    )
+                    Text(
+                        diagnostics,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = Color(0xFF7CE8FF)
                     )
                 }
                 Text(
@@ -408,72 +500,12 @@ private fun SelectedContactCard(
 
 @Composable
 private fun Map3DHost(
+    map3DView: Map3DView,
     modifier: Modifier = Modifier,
-    onReady: (GoogleMap3D) -> Unit,
-    onError: (Exception) -> Unit
 ) {
-    val context = LocalContext.current
-    val lifecycleOwner = LocalLifecycleOwner.current
-    val currentOnReady = rememberUpdatedState(onReady)
-    val currentOnError = rememberUpdatedState(onError)
-
-    val map3DView = remember {
-        val config = Map3DInitConfig.create(
-            centerLat = 52.1,
-            centerLng = 5.3,
-            centerAlt = 0.0,
-            heading = 0.0,
-            tilt = 55.0,
-            roll = 0.0,
-            range = 1_000_000.0,
-            minAltitude = 0.0,
-            maxAltitude = 1_000_000.0,
-            minHeading = 0.0,
-            maxHeading = 360.0,
-            minTilt = 0.0,
-            maxTilt = 90.0,
-            bounds = null,
-            mapMode = Map3DMode.HYBRID,
-            mapId = null,
-            language = Locale.getDefault().language,
-            region = Locale.getDefault().country
-        )
-
-        Map3DView(context, config).apply {
-            onCreate(null)
-            getMap3DViewAsync(object : OnMap3DViewReadyCallback {
-                override fun onMap3DViewReady(googleMap3D: GoogleMap3D) {
-                    currentOnReady.value(googleMap3D)
-                }
-
-                override fun onError(error: Exception) {
-                    currentOnError.value(error)
-                }
-            })
-        }
-    }
-
-    DisposableEffect(lifecycleOwner, map3DView) {
-        val observer = LifecycleEventObserver { _, event ->
-            when (event) {
-                Lifecycle.Event.ON_START -> map3DView.onStart()
-                Lifecycle.Event.ON_RESUME -> map3DView.onResume()
-                Lifecycle.Event.ON_PAUSE -> map3DView.onPause()
-                Lifecycle.Event.ON_STOP -> map3DView.onStop()
-                Lifecycle.Event.ON_DESTROY -> map3DView.onDestroy()
-                else -> Unit
-            }
-        }
-
-        lifecycleOwner.lifecycle.addObserver(observer)
-
-        onDispose {
-            lifecycleOwner.lifecycle.removeObserver(observer)
-        }
-    }
-
     AndroidView(
         modifier = modifier,
-        factory = { map3DView }
+        factory = { map3DView },
+        update = { _ -> Unit },
     )
 }

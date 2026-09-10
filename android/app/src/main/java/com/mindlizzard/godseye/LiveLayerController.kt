@@ -1,6 +1,6 @@
 package com.mindlizzard.godseye
 
-import android.graphics.Color
+import android.os.SystemClock
 import com.google.android.gms.maps3d.GoogleMap3D
 import com.google.android.gms.maps3d.model.AltitudeMode
 import com.google.android.gms.maps3d.model.CollisionBehavior
@@ -28,6 +28,7 @@ import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.roundToInt
 import kotlin.math.sin
+import kotlin.math.sqrt
 
 enum class LiveLayerId(val title: String, val source: String) {
     FLIGHTS("Vluchten", "OpenSky"),
@@ -83,7 +84,60 @@ class LiveLayerController(
     private val latestPoints = mutableMapOf<LiveLayerId, List<LayerPoint>>()
     private val enabledLayers = mutableSetOf<LiveLayerId>()
     private val motionCursor = mutableMapOf<LiveLayerId, Int>()
+
     @Volatile private var closed = false
+    @Volatile private var cameraMoving = false
+    @Volatile private var sceneSteady = true
+    @Volatile private var lastCameraChangeMs = 0L
+    @Volatile private var cameraCenterLat = 52.1
+    @Volatile private var cameraCenterLon = 5.3
+    @Volatile private var cameraRangeMeters = 2_000_000.0
+
+    init {
+        map.getCamera()?.let { camera ->
+            val center = camera.getCenter()
+            cameraCenterLat = center.latitude
+            cameraCenterLon = center.longitude
+            cameraRangeMeters = camera.getRange() ?: cameraRangeMeters
+        }
+
+        // The callback may fire every frame. Keep it deliberately tiny: never add,
+        // remove, or update map objects from inside a camera callback.
+        map.setCameraChangedListener { camera ->
+            val center = camera.getCenter()
+            cameraCenterLat = center.latitude
+            cameraCenterLon = center.longitude
+            cameraRangeMeters = camera.getRange() ?: cameraRangeMeters
+            lastCameraChangeMs = SystemClock.uptimeMillis()
+            cameraMoving = true
+        }
+
+        map.setOnMapSteadyListener { steady ->
+            sceneSteady = steady
+        }
+
+        // One monitor coroutine replaces a flood of per-frame debounce coroutines.
+        scope.launch {
+            var wasMoving = false
+            while (isActive) {
+                delay(CAMERA_MONITOR_MS)
+                if (closed) break
+
+                val quietFor = SystemClock.uptimeMillis() - lastCameraChangeMs
+                val nowMoving = cameraMoving && quietFor < CAMERA_SETTLE_MS
+
+                if (cameraMoving && !nowMoving) {
+                    cameraMoving = false
+                }
+
+                if (wasMoving && !cameraMoving) {
+                    // Camera gesture has ended. Only now touch the renderer again.
+                    enabledLayers.toList().forEach { renderLayerFromCache(it) }
+                }
+                wasMoving = cameraMoving
+            }
+        }
+    }
 
     fun setEnabled(layer: LiveLayerId, enabled: Boolean) {
         if (enabled) {
@@ -96,9 +150,26 @@ class LiveLayerController(
     }
 
     fun close() {
+        if (closed) return
         closed = true
+
+        // Avoid callbacks retaining a controller after the Activity/view is gone.
+        runCatching { map.setCameraChangedListener(null) }
+        runCatching { map.setOnMapSteadyListener(null) }
+
         LiveLayerId.entries.forEach { stop(it) }
         scope.coroutineContext[Job]?.cancel()
+    }
+
+    fun diagnosticsText(): String {
+        val rendered = markers.values.sumOf { it.size }
+        val rangeKm = (cameraRangeMeters / 1000.0).roundToInt()
+        val renderer = when {
+            cameraMoving -> "CAMERA"
+            !sceneSteady -> "TILES"
+            else -> "IDLE"
+        }
+        return "$renderer · ${rangeKm} km · $rendered objecten"
     }
 
     private fun start(layer: LiveLayerId) {
@@ -160,7 +231,7 @@ class LiveLayerController(
     }
 
     private fun renderLayerFromCache(layer: LiveLayerId) {
-        if (layer !in enabledLayers) return
+        if (layer !in enabledLayers || cameraMoving) return
         val allPoints = latestPoints[layer] ?: return
         val visible = selectForCamera(layer, allPoints)
         syncMarkers(layer, visible)
@@ -174,27 +245,79 @@ class LiveLayerController(
     }
 
     private fun selectForCamera(layer: LiveLayerId, points: List<LayerPoint>): List<LayerPoint> {
-        val cap = markerCap(layer)
-        if (points.size <= cap) return points
+        val cap = markerCap(layer, cameraRangeMeters)
+        if (points.isEmpty() || cap <= 0) return emptyList()
 
-        // Maps 3D 0.2.2 does not expose the newer camera-state helpers used by
-        // Google's current sample catalog. Keep a conservative fixed mobile LOD
-        // until we can move to a newer SDK surface.
-        //
-        // Spread the sample deterministically across the feed instead of taking
-        // only the first N rows, so the regional picture stays useful.
+        // At true globe distance, keep a geographically distributed sample.
+        // At regional/local distance, keep only contacts near the camera center.
+        if (cameraRangeMeters >= GLOBAL_VIEW_RANGE_M) {
+            return evenlySample(points, cap)
+        }
+
+        val radiusMeters = (cameraRangeMeters * VIEW_RADIUS_FACTOR)
+            .coerceIn(MIN_VIEW_RADIUS_M, MAX_REGIONAL_RADIUS_M)
+
+        return points
+            .asSequence()
+            .map { it to greatCircleDistanceMeters(it.latitude, it.longitude) }
+            .filter { (_, distance) -> distance <= radiusMeters }
+            .sortedBy { (_, distance) -> distance }
+            .take(cap)
+            .map { (point, _) -> point }
+            .toList()
+    }
+
+    private fun markerCap(layer: LiveLayerId, rangeMeters: Double): Int {
+        val globe = rangeMeters >= 8_000_000.0
+        val continent = rangeMeters >= 3_000_000.0
+        val country = rangeMeters >= 1_000_000.0
+
+        return when (layer) {
+            LiveLayerId.FLIGHTS -> when {
+                globe -> 18
+                continent -> 30
+                country -> 45
+                else -> 60
+            }
+            LiveLayerId.MILITARY -> when {
+                globe -> 8
+                continent -> 12
+                country -> 18
+                else -> 24
+            }
+            LiveLayerId.EARTHQUAKES -> when {
+                globe -> 18
+                continent -> 25
+                country -> 35
+                else -> 45
+            }
+            LiveLayerId.ISS -> 1
+            LiveLayerId.LAUNCHES -> 12
+        }
+    }
+
+    private fun evenlySample(points: List<LayerPoint>, cap: Int): List<LayerPoint> {
+        if (points.size <= cap) return points
         val step = points.size.toDouble() / cap.toDouble()
         return List(cap) { index ->
             points[(index * step).toInt().coerceIn(0, points.lastIndex)]
         }
     }
 
-    private fun markerCap(layer: LiveLayerId): Int = when (layer) {
-        LiveLayerId.FLIGHTS -> 55
-        LiveLayerId.MILITARY -> 20
-        LiveLayerId.EARTHQUAKES -> 35
-        LiveLayerId.ISS -> 1
-        LiveLayerId.LAUNCHES -> 12
+    private fun greatCircleDistanceMeters(lat: Double, lon: Double): Double {
+        val lat1 = Math.toRadians(cameraCenterLat)
+        val lat2 = Math.toRadians(lat)
+        val dLat = lat2 - lat1
+        val dLon = Math.toRadians(lon - cameraCenterLon)
+
+        val halfLat = sin(dLat / 2.0)
+        val halfLon = sin(dLon / 2.0)
+        val a = (
+            halfLat * halfLat +
+                cos(lat1) * cos(lat2) * halfLon * halfLon
+            ).coerceIn(0.0, 1.0)
+
+        return 2.0 * EARTH_RADIUS_M * asin(sqrt(a))
     }
 
     private fun syncMarkers(layer: LiveLayerId, points: List<LayerPoint>) {
@@ -431,12 +554,20 @@ class LiveLayerController(
             state.renderLon = moved.second
         }
 
-        val renderBudget = when (layer) {
-            LiveLayerId.FLIGHTS -> 18
-            LiveLayerId.MILITARY -> 10
-            LiveLayerId.ISS -> 1
-            else -> 0
+        // Never compete with pinch/rotate/tilt gestures for the experimental renderer.
+        if (cameraMoving) return
+
+        // At continent/globe scale true aircraft movement is sub-pixel, so sending
+        // dozens of renderer updates per second buys nothing and can starve gestures.
+        val renderBudget = when {
+            layer == LiveLayerId.ISS -> 1
+            cameraRangeMeters >= 8_000_000.0 -> 0
+            cameraRangeMeters >= 3_000_000.0 -> if (layer == LiveLayerId.FLIGHTS) 2 else 1
+            cameraRangeMeters >= 1_000_000.0 -> if (layer == LiveLayerId.FLIGHTS) 4 else 2
+            else -> if (layer == LiveLayerId.FLIGHTS) 8 else 4
         }
+
+        if (renderBudget <= 0) return
 
         val start = (motionCursor[layer] ?: 0) % movingStates.size
         repeat(minOf(renderBudget, movingStates.size)) { offset ->
@@ -497,7 +628,14 @@ class LiveLayerController(
 
     companion object {
         private const val MOTION_TICK_MS = 1_000L
+        private const val CAMERA_MONITOR_MS = 100L
+        private const val CAMERA_SETTLE_MS = 450L
+
         private const val EARTH_RADIUS_M = 6_371_000.0
+        private const val GLOBAL_VIEW_RANGE_M = 8_000_000.0
+        private const val VIEW_RADIUS_FACTOR = 1.65
+        private const val MIN_VIEW_RADIUS_M = 250_000.0
+        private const val MAX_REGIONAL_RADIUS_M = 7_500_000.0
     }
 }
 
