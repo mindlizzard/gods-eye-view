@@ -52,7 +52,7 @@ private data class LayerPoint(
     val latitude: Double,
     val longitude: Double,
     val altitudeMeters: Double,
-    val altitudeMode: AltitudeMode,
+    val altitudeMode: Int,
     val details: String,
 )
 
@@ -172,12 +172,12 @@ class LiveLayerController(
         LiveLayerId.LAUNCHES -> 15 * 60_000L
     }
 
-    private fun styleFor(layer: LiveLayerId): Triple<Int, Int, Double> = when (layer) {
-        LiveLayerId.FLIGHTS -> Triple(Color.rgb(40, 170, 255), Color.WHITE, 0.62)
-        LiveLayerId.MILITARY -> Triple(Color.rgb(255, 184, 0), Color.WHITE, 0.66)
-        LiveLayerId.EARTHQUAKES -> Triple(Color.rgb(255, 82, 82), Color.WHITE, 0.58)
-        LiveLayerId.ISS -> Triple(Color.rgb(163, 113, 255), Color.WHITE, 0.82)
-        LiveLayerId.LAUNCHES -> Triple(Color.rgb(255, 120, 45), Color.WHITE, 0.68)
+    private fun styleFor(layer: LiveLayerId): Triple<Int, Int, Float> = when (layer) {
+        LiveLayerId.FLIGHTS -> Triple(Color.rgb(40, 170, 255), Color.WHITE, 0.62f)
+        LiveLayerId.MILITARY -> Triple(Color.rgb(255, 184, 0), Color.WHITE, 0.66f)
+        LiveLayerId.EARTHQUAKES -> Triple(Color.rgb(255, 82, 82), Color.WHITE, 0.58f)
+        LiveLayerId.ISS -> Triple(Color.rgb(163, 113, 255), Color.WHITE, 0.82f)
+        LiveLayerId.LAUNCHES -> Triple(Color.rgb(255, 120, 45), Color.WHITE, 0.68f)
     }
 }
 
