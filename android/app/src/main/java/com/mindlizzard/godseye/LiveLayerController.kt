@@ -63,11 +63,12 @@ private data class LayerPoint(
 )
 
 private data class LiveMarkerState(
-    val marker: Marker,
+    var marker: Marker,
     var point: LayerPoint,
     var renderLat: Double,
     var renderLon: Double,
     var renderAltitudeMeters: Double,
+    var headingBucket: Int? = null,
 )
 
 class LiveLayerController(
@@ -153,51 +154,79 @@ class LiveLayerController(
         points.forEach { incoming ->
             val existing = layerMarkers[incoming.id]
 
+            val correctedPoint =
+                if (existing != null && layer == LiveLayerId.ISS && incoming.moving) {
+                    val inferredTrack = bearingDegrees(
+                        existing.point.latitude,
+                        existing.point.longitude,
+                        incoming.latitude,
+                        incoming.longitude
+                    )
+                    incoming.copy(trackDegrees = inferredTrack)
+                } else {
+                    incoming
+                }
+
+            val desiredBucket = headingBucketFor(layer, correctedPoint.trackDegrees)
+
             if (existing != null) {
-                val correctedPoint =
-                    if (layer == LiveLayerId.ISS && incoming.moving) {
-                        val inferredTrack = bearingDegrees(
-                            existing.point.latitude,
-                            existing.point.longitude,
-                            incoming.latitude,
-                            incoming.longitude
-                        )
-                        incoming.copy(trackDegrees = inferredTrack)
-                    } else {
-                        incoming
-                    }
+                // A plane should visibly point along its reported true track.
+                // Recreate only when it crosses a 22.5-degree bucket, not every motion tick.
+                if (desiredBucket != null && desiredBucket != existing.headingBucket) {
+                    runCatching { existing.marker.remove() }
+                    val replacement = createMarker(layer, correctedPoint) ?: return@forEach
 
-                existing.point = correctedPoint
+                    existing.marker = replacement
+                    existing.headingBucket = desiredBucket
+                    existing.point = correctedPoint
+                    existing.renderLat = correctedPoint.latitude
+                    existing.renderLon = correctedPoint.longitude
+                    existing.renderAltitudeMeters = correctedPoint.altitudeMeters
 
-                // Fresh telemetry is authoritative. Snap back to the newest fix, then
-                // continue dead-reckoning every second until the next network update.
-                existing.renderLat = correctedPoint.latitude
-                existing.renderLon = correctedPoint.longitude
-                existing.renderAltitudeMeters = correctedPoint.altitudeMeters
-                updateMarkerPosition(existing)
+                    bindClickListener(layer, correctedPoint.id, replacement, correctedPoint)
+                    updateMarkerPosition(existing)
+                } else {
+                    existing.point = correctedPoint
+
+                    // Fresh telemetry is authoritative. Snap back to the newest fix, then
+                    // continue dead-reckoning at 4 Hz until the next network update.
+                    existing.renderLat = correctedPoint.latitude
+                    existing.renderLon = correctedPoint.longitude
+                    existing.renderAltitudeMeters = correctedPoint.altitudeMeters
+                    updateMarkerPosition(existing)
+                }
             } else {
-                val marker = createMarker(layer, incoming) ?: return@forEach
+                val marker = createMarker(layer, correctedPoint) ?: return@forEach
                 val state = LiveMarkerState(
                     marker = marker,
-                    point = incoming,
-                    renderLat = incoming.latitude,
-                    renderLon = incoming.longitude,
-                    renderAltitudeMeters = incoming.altitudeMeters
+                    point = correctedPoint,
+                    renderLat = correctedPoint.latitude,
+                    renderLon = correctedPoint.longitude,
+                    renderAltitudeMeters = correctedPoint.altitudeMeters,
+                    headingBucket = desiredBucket
                 )
-                layerMarkers[incoming.id] = state
+                layerMarkers[correctedPoint.id] = state
+                bindClickListener(layer, correctedPoint.id, marker, correctedPoint)
+            }
+        }
+    }
 
-                marker.setClickListener {
-                    scope.launch(Dispatchers.Main) {
-                        val latest = markers[layer]?.get(incoming.id)?.point ?: incoming
-                        onSelection(
-                            SelectedContact(
-                                title = latest.label,
-                                subtitle = layer.title.uppercase(),
-                                details = latest.details
-                            )
-                        )
-                    }
-                }
+    private fun bindClickListener(
+        layer: LiveLayerId,
+        id: String,
+        marker: Marker,
+        fallback: LayerPoint,
+    ) {
+        marker.setClickListener {
+            scope.launch(Dispatchers.Main) {
+                val latest = markers[layer]?.get(id)?.point ?: fallback
+                onSelection(
+                    SelectedContact(
+                        title = latest.label,
+                        subtitle = layer.title.uppercase(),
+                        details = latest.details
+                    )
+                )
             }
         }
     }
@@ -222,17 +251,71 @@ class LiveLayerController(
                 isExtruded = false
                 isDrawnWhenOccluded = true
                 collisionBehavior = CollisionBehavior.OPTIONAL_AND_HIDES_LOWER_PRIORITY
-                setStyle(ImageView(iconFor(layer)))
+                setStyle(ImageView(iconFor(layer, point.trackDegrees)))
             }
         )
 
-    private fun iconFor(layer: LiveLayerId): Int = when (layer) {
-        LiveLayerId.FLIGHTS -> R.drawable.ic_contact_aircraft
-        LiveLayerId.MILITARY -> R.drawable.ic_contact_military
+    private fun iconFor(layer: LiveLayerId, trackDegrees: Double?): Int = when (layer) {
+        LiveLayerId.FLIGHTS -> aircraftIcon(headingBucket(trackDegrees) ?: 0, military = false)
+        LiveLayerId.MILITARY -> aircraftIcon(headingBucket(trackDegrees) ?: 0, military = true)
         LiveLayerId.EARTHQUAKES -> R.drawable.ic_contact_quake
         LiveLayerId.ISS -> R.drawable.ic_contact_satellite
         LiveLayerId.LAUNCHES -> R.drawable.ic_contact_rocket
     }
+
+    private fun headingBucketFor(layer: LiveLayerId, trackDegrees: Double?): Int? =
+        if (layer == LiveLayerId.FLIGHTS || layer == LiveLayerId.MILITARY) {
+            headingBucket(trackDegrees)
+        } else {
+            null
+        }
+
+    private fun headingBucket(trackDegrees: Double?): Int? {
+        val raw = trackDegrees?.takeIf { it.isFinite() } ?: return null
+        val normalized = ((raw % 360.0) + 360.0) % 360.0
+        return (((normalized + 11.25) / 22.5).toInt()) % 16
+    }
+
+    private fun aircraftIcon(bucket: Int, military: Boolean): Int =
+        if (military) {
+            when (bucket) {
+                0 -> R.drawable.ic_contact_military_000
+                1 -> R.drawable.ic_contact_military_023
+                2 -> R.drawable.ic_contact_military_045
+                3 -> R.drawable.ic_contact_military_068
+                4 -> R.drawable.ic_contact_military_090
+                5 -> R.drawable.ic_contact_military_113
+                6 -> R.drawable.ic_contact_military_135
+                7 -> R.drawable.ic_contact_military_158
+                8 -> R.drawable.ic_contact_military_180
+                9 -> R.drawable.ic_contact_military_203
+                10 -> R.drawable.ic_contact_military_225
+                11 -> R.drawable.ic_contact_military_248
+                12 -> R.drawable.ic_contact_military_270
+                13 -> R.drawable.ic_contact_military_293
+                14 -> R.drawable.ic_contact_military_315
+                else -> R.drawable.ic_contact_military_338
+            }
+        } else {
+            when (bucket) {
+                0 -> R.drawable.ic_contact_aircraft_000
+                1 -> R.drawable.ic_contact_aircraft_023
+                2 -> R.drawable.ic_contact_aircraft_045
+                3 -> R.drawable.ic_contact_aircraft_068
+                4 -> R.drawable.ic_contact_aircraft_090
+                5 -> R.drawable.ic_contact_aircraft_113
+                6 -> R.drawable.ic_contact_aircraft_135
+                7 -> R.drawable.ic_contact_aircraft_158
+                8 -> R.drawable.ic_contact_aircraft_180
+                9 -> R.drawable.ic_contact_aircraft_203
+                10 -> R.drawable.ic_contact_aircraft_225
+                11 -> R.drawable.ic_contact_aircraft_248
+                12 -> R.drawable.ic_contact_aircraft_270
+                13 -> R.drawable.ic_contact_aircraft_293
+                14 -> R.drawable.ic_contact_aircraft_315
+                else -> R.drawable.ic_contact_aircraft_338
+            }
+        }
 
     private fun advanceMovingContacts(layer: LiveLayerId, dtSeconds: Double) {
         if (layer != LiveLayerId.FLIGHTS &&
@@ -248,7 +331,8 @@ class LiveLayerController(
             val track = point.trackDegrees ?: return@forEach
             if (speed <= 0.5 || !speed.isFinite() || !track.isFinite()) return@forEach
 
-            val distance = (speed * dtSeconds).coerceAtMost(MAX_DEAD_RECKON_METERS_PER_TICK)
+            val maxSpeedMps = if (layer == LiveLayerId.ISS) 9_000.0 else 1_200.0
+            val distance = speed.coerceAtMost(maxSpeedMps) * dtSeconds
             val moved = destinationPoint(
                 state.renderLat,
                 state.renderLon,
@@ -321,9 +405,8 @@ class LiveLayerController(
     }
 
     companion object {
-        private const val MOTION_TICK_MS = 1_000L
+        private const val MOTION_TICK_MS = 250L
         private const val EARTH_RADIUS_M = 6_371_000.0
-        private const val MAX_DEAD_RECKON_METERS_PER_TICK = 500.0
     }
 }
 
