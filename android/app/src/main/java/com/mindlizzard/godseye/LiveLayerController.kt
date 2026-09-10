@@ -4,11 +4,10 @@ import android.graphics.Color
 import com.google.android.gms.maps3d.GoogleMap3D
 import com.google.android.gms.maps3d.model.AltitudeMode
 import com.google.android.gms.maps3d.model.CollisionBehavior
-import com.google.android.gms.maps3d.model.Glyph
+import com.google.android.gms.maps3d.model.ImageView
 import com.google.android.gms.maps3d.model.Marker
 import com.google.android.gms.maps3d.model.latLngAltitude
 import com.google.android.gms.maps3d.model.markerOptions
-import com.google.android.gms.maps3d.model.pinConfiguration
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -24,7 +23,11 @@ import java.net.URL
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import kotlin.math.asin
+import kotlin.math.atan2
+import kotlin.math.cos
 import kotlin.math.roundToInt
+import kotlin.math.sin
 
 enum class LiveLayerId(val title: String, val source: String) {
     FLIGHTS("Vluchten", "OpenSky"),
@@ -54,6 +57,17 @@ private data class LayerPoint(
     val altitudeMeters: Double,
     val altitudeMode: Int,
     val details: String,
+    val speedMps: Double? = null,
+    val trackDegrees: Double? = null,
+    val moving: Boolean = false,
+)
+
+private data class LiveMarkerState(
+    val marker: Marker,
+    var point: LayerPoint,
+    var renderLat: Double,
+    var renderLon: Double,
+    var renderAltitudeMeters: Double,
 )
 
 class LiveLayerController(
@@ -63,7 +77,7 @@ class LiveLayerController(
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private val jobs = mutableMapOf<LiveLayerId, Job>()
-    private val markers = mutableMapOf<LiveLayerId, MutableList<Marker>>()
+    private val markers = mutableMapOf<LiveLayerId, MutableMap<String, LiveMarkerState>>()
 
     fun setEnabled(layer: LiveLayerId, enabled: Boolean) {
         if (enabled) start(layer) else stop(layer)
@@ -79,7 +93,11 @@ class LiveLayerController(
 
         jobs[layer] = scope.launch {
             while (isActive) {
-                onLayerState(layer, LayerUiState(loading = true, count = markers[layer]?.size ?: 0))
+                onLayerState(layer, LayerUiState(
+                    loading = true,
+                    count = markers[layer]?.size ?: 0
+                ))
+
                 try {
                     val points = withContext(Dispatchers.IO) {
                         when (layer) {
@@ -90,94 +108,220 @@ class LiveLayerController(
                             LiveLayerId.LAUNCHES -> LiveSources.fetchLaunches()
                         }
                     }
-                    replaceMarkers(layer, points)
+
+                    syncMarkers(layer, points)
                     onLayerState(layer, LayerUiState(count = points.size))
                 } catch (t: Throwable) {
                     val short = t.message?.take(90) ?: t.javaClass.simpleName
-                    onLayerState(layer, LayerUiState(
-                        count = markers[layer]?.size ?: 0,
-                        error = short
-                    ))
+                    onLayerState(
+                        layer,
+                        LayerUiState(
+                            count = markers[layer]?.size ?: 0,
+                            error = short
+                        )
+                    )
                 }
 
-                delay(refreshInterval(layer))
+                var waited = 0L
+                val interval = refreshInterval(layer)
+                while (isActive && waited < interval) {
+                    delay(MOTION_TICK_MS)
+                    advanceMovingContacts(layer, MOTION_TICK_MS / 1000.0)
+                    waited += MOTION_TICK_MS
+                }
             }
         }
     }
 
     private fun stop(layer: LiveLayerId) {
         jobs.remove(layer)?.cancel()
-        markers.remove(layer)?.forEach { marker ->
-            runCatching { marker.remove() }
+        markers.remove(layer)?.values?.forEach { state ->
+            runCatching { state.marker.remove() }
         }
         onLayerState(layer, LayerUiState())
     }
 
-    private fun replaceMarkers(layer: LiveLayerId, points: List<LayerPoint>) {
-        markers.remove(layer)?.forEach { runCatching { it.remove() } }
-        val newMarkers = mutableListOf<Marker>()
-        val style = styleFor(layer)
+    private fun syncMarkers(layer: LiveLayerId, points: List<LayerPoint>) {
+        val layerMarkers = markers.getOrPut(layer) { linkedMapOf() }
+        val incomingIds = points.asSequence().map { it.id }.toHashSet()
 
-        points.forEach { point ->
-            val marker = map.addMarker(
-                markerOptions {
-                    id = "${layer.name}:${point.id}"
-                    position = latLngAltitude {
-                        latitude = point.latitude
-                        longitude = point.longitude
-                        altitude = point.altitudeMeters
+        val staleIds = layerMarkers.keys.filter { it !in incomingIds }
+        staleIds.forEach { id ->
+            layerMarkers.remove(id)?.let { runCatching { it.marker.remove() } }
+        }
+
+        points.forEach { incoming ->
+            val existing = layerMarkers[incoming.id]
+
+            if (existing != null) {
+                val correctedPoint =
+                    if (layer == LiveLayerId.ISS && incoming.moving) {
+                        val inferredTrack = bearingDegrees(
+                            existing.point.latitude,
+                            existing.point.longitude,
+                            incoming.latitude,
+                            incoming.longitude
+                        )
+                        incoming.copy(trackDegrees = inferredTrack)
+                    } else {
+                        incoming
                     }
-                    label = point.label.take(42)
-                    altitudeMode = point.altitudeMode
-                    isExtruded = layer == LiveLayerId.FLIGHTS ||
-                        layer == LiveLayerId.MILITARY ||
-                        layer == LiveLayerId.ISS
-                    isDrawnWhenOccluded = true
-                    collisionBehavior = CollisionBehavior.OPTIONAL_AND_HIDES_LOWER_PRIORITY
-                    setStyle(
-                        pinConfiguration {
-                            backgroundColor = style.first
-                            borderColor = style.second
-                            scale = style.third
-                            setGlyph(Glyph.fromColor(Color.WHITE))
-                        }
-                    )
-                }
-            )
 
-            marker?.let { m ->
-                m.setClickListener {
+                existing.point = correctedPoint
+
+                // Fresh telemetry is authoritative. Snap back to the newest fix, then
+                // continue dead-reckoning every second until the next network update.
+                existing.renderLat = correctedPoint.latitude
+                existing.renderLon = correctedPoint.longitude
+                existing.renderAltitudeMeters = correctedPoint.altitudeMeters
+                updateMarkerPosition(existing)
+            } else {
+                val marker = createMarker(layer, incoming) ?: return@forEach
+                val state = LiveMarkerState(
+                    marker = marker,
+                    point = incoming,
+                    renderLat = incoming.latitude,
+                    renderLon = incoming.longitude,
+                    renderAltitudeMeters = incoming.altitudeMeters
+                )
+                layerMarkers[incoming.id] = state
+
+                marker.setClickListener {
                     scope.launch(Dispatchers.Main) {
+                        val latest = markers[layer]?.get(incoming.id)?.point ?: incoming
                         onSelection(
                             SelectedContact(
-                                title = point.label,
+                                title = latest.label,
                                 subtitle = layer.title.uppercase(),
-                                details = point.details
+                                details = latest.details
                             )
                         )
                     }
                 }
-                newMarkers += m
             }
         }
+    }
 
-        markers[layer] = newMarkers
+    private fun createMarker(layer: LiveLayerId, point: LayerPoint): Marker? =
+        map.addMarker(
+            markerOptions {
+                id = "${layer.name}:${point.id}"
+                position = latLngAltitude {
+                    latitude = point.latitude
+                    longitude = point.longitude
+                    altitude = point.altitudeMeters
+                }
+
+                // The old build labelled every single plane, turning Europe into alphabet soup.
+                // Only unique low-density contacts get a permanent label.
+                if (layer == LiveLayerId.ISS) {
+                    label = point.label
+                }
+
+                altitudeMode = point.altitudeMode
+                isExtruded = false
+                isDrawnWhenOccluded = true
+                collisionBehavior = CollisionBehavior.OPTIONAL_AND_HIDES_LOWER_PRIORITY
+                setStyle(ImageView(iconFor(layer)))
+            }
+        )
+
+    private fun iconFor(layer: LiveLayerId): Int = when (layer) {
+        LiveLayerId.FLIGHTS -> R.drawable.ic_contact_aircraft
+        LiveLayerId.MILITARY -> R.drawable.ic_contact_military
+        LiveLayerId.EARTHQUAKES -> R.drawable.ic_contact_quake
+        LiveLayerId.ISS -> R.drawable.ic_contact_satellite
+        LiveLayerId.LAUNCHES -> R.drawable.ic_contact_rocket
+    }
+
+    private fun advanceMovingContacts(layer: LiveLayerId, dtSeconds: Double) {
+        if (layer != LiveLayerId.FLIGHTS &&
+            layer != LiveLayerId.MILITARY &&
+            layer != LiveLayerId.ISS
+        ) return
+
+        markers[layer]?.values?.forEach { state ->
+            val point = state.point
+            if (!point.moving) return@forEach
+
+            val speed = point.speedMps ?: return@forEach
+            val track = point.trackDegrees ?: return@forEach
+            if (speed <= 0.5 || !speed.isFinite() || !track.isFinite()) return@forEach
+
+            val distance = (speed * dtSeconds).coerceAtMost(MAX_DEAD_RECKON_METERS_PER_TICK)
+            val moved = destinationPoint(
+                state.renderLat,
+                state.renderLon,
+                track,
+                distance
+            )
+            state.renderLat = moved.first
+            state.renderLon = moved.second
+            updateMarkerPosition(state)
+        }
+    }
+
+    private fun updateMarkerPosition(state: LiveMarkerState) {
+        state.marker.position = latLngAltitude {
+            latitude = state.renderLat
+            longitude = state.renderLon
+            altitude = state.renderAltitudeMeters
+        }
     }
 
     private fun refreshInterval(layer: LiveLayerId): Long = when (layer) {
-        LiveLayerId.ISS -> 10_000L
-        LiveLayerId.MILITARY -> 30_000L
+        LiveLayerId.ISS -> 5_000L
+        LiveLayerId.MILITARY -> 20_000L
         LiveLayerId.FLIGHTS -> 60_000L
         LiveLayerId.EARTHQUAKES -> 120_000L
         LiveLayerId.LAUNCHES -> 15 * 60_000L
     }
 
-    private fun styleFor(layer: LiveLayerId): Triple<Int, Int, Float> = when (layer) {
-        LiveLayerId.FLIGHTS -> Triple(Color.rgb(40, 170, 255), Color.WHITE, 0.62f)
-        LiveLayerId.MILITARY -> Triple(Color.rgb(255, 184, 0), Color.WHITE, 0.66f)
-        LiveLayerId.EARTHQUAKES -> Triple(Color.rgb(255, 82, 82), Color.WHITE, 0.58f)
-        LiveLayerId.ISS -> Triple(Color.rgb(163, 113, 255), Color.WHITE, 0.82f)
-        LiveLayerId.LAUNCHES -> Triple(Color.rgb(255, 120, 45), Color.WHITE, 0.68f)
+    private fun destinationPoint(
+        latDegrees: Double,
+        lonDegrees: Double,
+        bearingDegrees: Double,
+        distanceMeters: Double,
+    ): Pair<Double, Double> {
+        val angularDistance = distanceMeters / EARTH_RADIUS_M
+        val bearing = Math.toRadians(bearingDegrees)
+        val lat1 = Math.toRadians(latDegrees)
+        val lon1 = Math.toRadians(lonDegrees)
+
+        val lat2 = asin(
+            sin(lat1) * cos(angularDistance) +
+                cos(lat1) * sin(angularDistance) * cos(bearing)
+        )
+        val lon2 = lon1 + atan2(
+            sin(bearing) * sin(angularDistance) * cos(lat1),
+            cos(angularDistance) - sin(lat1) * sin(lat2)
+        )
+
+        var normalizedLon = Math.toDegrees(lon2)
+        normalizedLon = ((normalizedLon + 540.0) % 360.0) - 180.0
+
+        return Math.toDegrees(lat2) to normalizedLon
+    }
+
+    private fun bearingDegrees(
+        fromLat: Double,
+        fromLon: Double,
+        toLat: Double,
+        toLon: Double,
+    ): Double {
+        val lat1 = Math.toRadians(fromLat)
+        val lat2 = Math.toRadians(toLat)
+        val deltaLon = Math.toRadians(toLon - fromLon)
+        val y = sin(deltaLon) * cos(lat2)
+        val x = cos(lat1) * sin(lat2) -
+            sin(lat1) * cos(lat2) * cos(deltaLon)
+        return (Math.toDegrees(atan2(y, x)) + 360.0) % 360.0
+    }
+
+    companion object {
+        private const val MOTION_TICK_MS = 1_000L
+        private const val EARTH_RADIUS_M = 6_371_000.0
+        private const val MAX_DEAD_RECKON_METERS_PER_TICK = 500.0
     }
 }
 
@@ -222,7 +366,11 @@ private object LiveSources {
 
         return out
             .sortedByDescending {
-                Regex("""M([0-9.]+)""").find(it.label)?.groupValues?.getOrNull(1)?.toDoubleOrNull() ?: 0.0
+                Regex("""M([0-9.]+)""")
+                    .find(it.label)
+                    ?.groupValues
+                    ?.getOrNull(1)
+                    ?.toDoubleOrNull() ?: 0.0
             }
             .take(220)
     }
@@ -246,14 +394,17 @@ private object LiveSources {
                 is String -> altRaw.toDoubleOrNull() ?: 0.0
                 else -> 0.0
             }
-            val gs = ac.optDouble("gs", Double.NaN)
+
+            val gsKnots = ac.optDouble("gs", Double.NaN)
             val track = ac.optDouble("track", Double.NaN)
             val type = ac.optString("t", "").trim()
+            val onGround = altRaw is String && altRaw.equals("ground", ignoreCase = true)
 
             val extra = buildList {
                 if (type.isNotBlank()) add(type)
-                if (gs.isFinite()) add("${gs.roundToInt()} kt")
+                if (gsKnots.isFinite()) add("${gsKnots.roundToInt()} kt")
                 if (track.isFinite()) add("${track.roundToInt()}°")
+                add(if (onGround) "ground" else "airborne")
                 add("ICAO ${hex.uppercase()}")
                 add("adsb.lol")
             }.joinToString(" · ")
@@ -263,17 +414,20 @@ private object LiveSources {
                 label = flight,
                 latitude = lat,
                 longitude = lon,
-                altitudeMeters = altitudeFeet * 0.3048,
-                altitudeMode = AltitudeMode.ABSOLUTE,
-                details = extra
+                altitudeMeters = if (onGround) 0.0 else altitudeFeet * 0.3048,
+                altitudeMode = if (onGround) AltitudeMode.CLAMP_TO_GROUND else AltitudeMode.ABSOLUTE,
+                details = extra,
+                speedMps = if (gsKnots.isFinite()) gsKnots * 0.514444 else null,
+                trackDegrees = if (track.isFinite()) track else null,
+                moving = !onGround && gsKnots.isFinite() && track.isFinite()
             )
         }
         return out.take(500)
     }
 
     fun fetchFlights(): List<LayerPoint> {
-        // Bounding box keeps the anonymous OpenSky request small enough for a phone.
-        // Western Europe is used for the first native port; camera-aware bboxes come next.
+        // First Android port: keep the anonymous request bounded to Western Europe.
+        // Later this becomes camera-aware, so we only fetch the part of Earth being viewed.
         val url = "https://opensky-network.org/api/states/all" +
             "?lamin=35&lomin=-15&lamax=60&lomax=30"
         val json = JSONObject(get(url))
@@ -293,13 +447,13 @@ private object LiveSources {
             val country = state.optString(2, "").trim()
             val baro = state.optNullableDouble(7)
             val geo = state.optNullableDouble(13)
-            val velocity = state.optNullableDouble(9)
+            val velocityMps = state.optNullableDouble(9)
             val track = state.optNullableDouble(10)
             val onGround = state.optBoolean(8, false)
 
             val details = buildList {
                 if (country.isNotBlank()) add(country)
-                if (velocity != null) add("${(velocity * 1.94384).roundToInt()} kt")
+                if (velocityMps != null) add("${(velocityMps * 1.94384).roundToInt()} kt")
                 if (track != null) add("${track.roundToInt()}°")
                 add(if (onGround) "ground" else "airborne")
                 add("ICAO ${icao.uppercase()}")
@@ -313,7 +467,10 @@ private object LiveSources {
                 longitude = lon,
                 altitudeMeters = if (onGround) 0.0 else (geo ?: baro ?: 0.0),
                 altitudeMode = if (onGround) AltitudeMode.CLAMP_TO_GROUND else AltitudeMode.ABSOLUTE,
-                details = details
+                details = details,
+                speedMps = velocityMps,
+                trackDegrees = track,
+                moving = !onGround && velocityMps != null && track != null
             )
         }
         return out.take(800)
@@ -332,6 +489,7 @@ private object LiveSources {
             add("${altitudeKm.roundToInt()} km")
             if (velocityKmh.isFinite()) add("${velocityKmh.roundToInt()} km/h")
             if (visibility.isNotBlank()) add(visibility)
+            add("Where The ISS At")
         }.joinToString(" · ")
 
         return listOf(
@@ -342,7 +500,10 @@ private object LiveSources {
                 longitude = lon,
                 altitudeMeters = altitudeKm * 1000.0,
                 altitudeMode = AltitudeMode.ABSOLUTE,
-                details = details
+                details = details,
+                speedMps = if (velocityKmh.isFinite()) velocityKmh / 3.6 else null,
+                trackDegrees = null,
+                moving = velocityKmh.isFinite()
             )
         )
     }
@@ -398,10 +559,11 @@ private object LiveSources {
             connection.readTimeout = 15_000
             connection.requestMethod = "GET"
             connection.setRequestProperty("Accept", "application/json")
-            connection.setRequestProperty("User-Agent", "GodsEye-Android/0.3 personal-native-client")
+            connection.setRequestProperty("User-Agent", "GodsEye-Android/0.4 personal-native-client")
 
             val code = connection.responseCode
-            val stream = if (code in 200..299) connection.inputStream else connection.errorStream
+            val stream =
+                if (code in 200..299) connection.inputStream else connection.errorStream
             val body = stream?.bufferedReader()?.use { it.readText() }.orEmpty()
 
             if (code !in 200..299) {
@@ -414,7 +576,8 @@ private object LiveSources {
     }
 
     private fun formatEpochMillis(epochMillis: Long): String =
-        if (epochMillis <= 0L) "" else clockFormatter.format(Instant.ofEpochMilli(epochMillis))
+        if (epochMillis <= 0L) ""
+        else clockFormatter.format(Instant.ofEpochMilli(epochMillis))
 
     private fun JSONArray.optNullableDouble(index: Int): Double? {
         if (index < 0 || index >= length() || isNull(index)) return null
