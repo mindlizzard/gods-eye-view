@@ -262,11 +262,13 @@ class LiveLayerController(
     }
 
     private fun updateMarkerPosition(state: LiveMarkerState) {
-        state.marker.position = latLngAltitude {
-            latitude = state.renderLat
-            longitude = state.renderLon
-            altitude = state.renderAltitudeMeters
-        }
+        state.marker.setPosition(
+            latLngAltitude {
+                latitude = state.renderLat
+                longitude = state.renderLon
+                altitude = state.renderAltitudeMeters
+            }
+        )
     }
 
     private fun refreshInterval(layer: LiveLayerId): Long = when (layer) {
