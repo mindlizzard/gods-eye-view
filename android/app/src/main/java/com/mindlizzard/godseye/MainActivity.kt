@@ -5,22 +5,33 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
@@ -60,6 +71,46 @@ class MainActivity : ComponentActivity() {
 private fun GodsEyeScreen() {
     var mapReady by remember { mutableStateOf(false) }
     var mapError by remember { mutableStateOf<String?>(null) }
+    var map3D by remember { mutableStateOf<GoogleMap3D?>(null) }
+    var showLayers by remember { mutableStateOf(false) }
+    var selected by remember { mutableStateOf<SelectedContact?>(null) }
+
+    val enabled = remember {
+        mutableStateMapOf(
+            LiveLayerId.FLIGHTS to false,
+            LiveLayerId.MILITARY to false,
+            LiveLayerId.EARTHQUAKES to false,
+            LiveLayerId.ISS to true,
+            LiveLayerId.LAUNCHES to false,
+        )
+    }
+
+    val uiStates = remember {
+        mutableStateMapOf<LiveLayerId, LayerUiState>().apply {
+            LiveLayerId.entries.forEach { put(it, LayerUiState()) }
+        }
+    }
+
+    val controller = remember(map3D) {
+        map3D?.let { map ->
+            LiveLayerController(
+                map = map,
+                onLayerState = { layer, state -> uiStates[layer] = state },
+                onSelection = { contact -> selected = contact },
+            )
+        }
+    }
+
+    DisposableEffect(controller) {
+        onDispose { controller?.close() }
+    }
+
+    LaunchedEffect(controller) {
+        val c = controller ?: return@LaunchedEffect
+        enabled.forEach { (layer, isEnabled) ->
+            c.setEnabled(layer, isEnabled)
+        }
+    }
 
     Box(modifier = Modifier.fillMaxSize()) {
         Map3DHost(
@@ -67,6 +118,7 @@ private fun GodsEyeScreen() {
             onReady = {
                 mapReady = true
                 mapError = null
+                map3D = it
             },
             onError = { error ->
                 mapReady = false
@@ -77,39 +129,73 @@ private fun GodsEyeScreen() {
         Card(
             modifier = Modifier
                 .align(Alignment.TopStart)
-                .padding(horizontal = 16.dp, vertical = 48.dp),
+                .padding(horizontal = 14.dp, vertical = 44.dp),
             colors = CardDefaults.cardColors(
-                containerColor = Color.Black.copy(alpha = 0.72f)
+                containerColor = Color.Black.copy(alpha = 0.76f)
             ),
-            shape = RoundedCornerShape(18.dp)
+            shape = RoundedCornerShape(16.dp)
         ) {
-            Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
+            Column(modifier = Modifier.padding(horizontal = 15.dp, vertical = 11.dp)) {
                 Text(
                     text = "GOD'S EYE",
                     style = MaterialTheme.typography.titleLarge
                 )
                 Text(
-                    text = if (mapReady) "Native 3D engine online" else "Native 3D engine starting…",
-                    style = MaterialTheme.typography.bodySmall
+                    text = if (mapReady) "NATIVE INTELLIGENCE CONSOLE · ONLINE"
+                    else "Native 3D engine starting…",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (mapReady) Color(0xFF7CFFB2) else Color.LightGray
                 )
             }
+        }
+
+        if (showLayers) {
+            LayerPanel(
+                modifier = Modifier
+                    .align(Alignment.CenterEnd)
+                    .padding(top = 92.dp, bottom = 88.dp, end = 10.dp),
+                enabled = enabled,
+                states = uiStates,
+                onToggle = { layer, checked ->
+                    enabled[layer] = checked
+                    controller?.setEnabled(layer, checked)
+                },
+                onClose = { showLayers = false },
+            )
+        }
+
+        selected?.let { contact ->
+            SelectedContactCard(
+                contact = contact,
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .padding(start = 12.dp, end = 12.dp, bottom = 82.dp),
+                onClose = { selected = null }
+            )
         }
 
         Row(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
-                .padding(16.dp)
+                .padding(14.dp)
                 .background(
-                    Color.Black.copy(alpha = 0.72f),
+                    Color.Black.copy(alpha = 0.78f),
                     RoundedCornerShape(18.dp)
                 )
-                .padding(horizontal = 14.dp, vertical = 10.dp),
-            horizontalArrangement = Arrangement.spacedBy(14.dp)
+                .padding(horizontal = 14.dp, vertical = 11.dp),
+            horizontalArrangement = Arrangement.spacedBy(17.dp),
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Text("3D")
-            Text("LAYERS")
-            Text("UAP")
-            Text("SAT")
+            BottomChip("3D")
+            BottomChip("LAYERS") { showLayers = !showLayers }
+            BottomChip("UAP") { showLayers = true }
+            BottomChip(
+                if (enabled[LiveLayerId.ISS] == true) "SAT ●" else "SAT"
+            ) {
+                val next = enabled[LiveLayerId.ISS] != true
+                enabled[LiveLayerId.ISS] = next
+                controller?.setEnabled(LiveLayerId.ISS, next)
+            }
         }
 
         mapError?.let { message ->
@@ -132,6 +218,171 @@ private fun GodsEyeScreen() {
                     )
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun BottomChip(text: String, onClick: (() -> Unit)? = null) {
+    Text(
+        text = text,
+        modifier = if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier,
+        color = Color.White,
+        style = MaterialTheme.typography.labelLarge
+    )
+}
+
+@Composable
+private fun LayerPanel(
+    modifier: Modifier,
+    enabled: Map<LiveLayerId, Boolean>,
+    states: Map<LiveLayerId, LayerUiState>,
+    onToggle: (LiveLayerId, Boolean) -> Unit,
+    onClose: () -> Unit,
+) {
+    Card(
+        modifier = modifier
+            .width(310.dp)
+            .fillMaxHeight(0.82f),
+        colors = CardDefaults.cardColors(
+            containerColor = Color(0xEE101418)
+        ),
+        shape = RoundedCornerShape(20.dp)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(16.dp)
+                .verticalScroll(rememberScrollState())
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("LIVE LAYERS", style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        "Native bronnen uit God's Eye View",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color.Gray
+                    )
+                }
+                Text(
+                    "SLUIT",
+                    modifier = Modifier.clickable(onClick = onClose),
+                    color = Color(0xFF7CE8FF),
+                    style = MaterialTheme.typography.labelMedium
+                )
+            }
+
+            Spacer(Modifier.padding(4.dp))
+            HorizontalDivider(color = Color.DarkGray)
+
+            LiveLayerId.entries.forEach { layer ->
+                val state = states[layer] ?: LayerUiState()
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 9.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(layer.title, style = MaterialTheme.typography.bodyLarge)
+                        Text(
+                            when {
+                                state.error != null -> state.error
+                                state.loading -> "laden…"
+                                state.count > 0 -> "${state.count} contacten · ${layer.source}"
+                                else -> layer.source
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = when {
+                                state.error != null -> Color(0xFFFF7D7D)
+                                state.count > 0 -> Color(0xFF7CFFB2)
+                                else -> Color.Gray
+                            }
+                        )
+                    }
+                    Switch(
+                        checked = enabled[layer] == true,
+                        onCheckedChange = { onToggle(layer, it) }
+                    )
+                }
+                HorizontalDivider(color = Color(0xFF252B30))
+            }
+
+            Text(
+                "VOLGENDE PORTS",
+                modifier = Modifier.padding(top = 14.dp, bottom = 8.dp),
+                style = MaterialTheme.typography.labelLarge,
+                color = Color(0xFF7CE8FF)
+            )
+
+            val nextLayers = listOf(
+                "Traffic",
+                "CCTV / publieke camera's",
+                "Radio",
+                "Bikeshare",
+                "AIS schepen",
+                "Military installations",
+                "Military awareness",
+                "Datacenters",
+                "Dammen",
+                "Onderzeese kabels",
+                "NASA FIRMS branden",
+                "UAP Intelligence",
+            )
+            nextLayers.forEach { name ->
+                Text(
+                    "○ $name",
+                    modifier = Modifier.padding(vertical = 4.dp),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color.LightGray
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SelectedContactCard(
+    contact: SelectedContact,
+    modifier: Modifier,
+    onClose: () -> Unit,
+) {
+    Card(
+        modifier = modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = Color.Black.copy(alpha = 0.83f)
+        ),
+        shape = RoundedCornerShape(16.dp)
+    ) {
+        Row(
+            modifier = Modifier.padding(14.dp),
+            verticalAlignment = Alignment.Top
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(contact.title, style = MaterialTheme.typography.titleMedium)
+                Text(
+                    contact.subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(0xFF7CE8FF)
+                )
+                if (contact.details.isNotBlank()) {
+                    Text(
+                        contact.details,
+                        modifier = Modifier.padding(top = 5.dp),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color.LightGray
+                    )
+                }
+            }
+            Text(
+                "×",
+                modifier = Modifier.clickable(onClick = onClose),
+                style = MaterialTheme.typography.titleLarge,
+                color = Color.White
+            )
         }
     }
 }
