@@ -40,6 +40,7 @@ enum class LiveLayerId(val title: String, val source: String) {
 data class LayerUiState(
     val loading: Boolean = false,
     val count: Int = 0,
+    val totalCount: Int = 0,
     val error: String? = null,
 )
 
@@ -79,12 +80,47 @@ class LiveLayerController(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private val jobs = mutableMapOf<LiveLayerId, Job>()
     private val markers = mutableMapOf<LiveLayerId, MutableMap<String, LiveMarkerState>>()
+    private val latestPoints = mutableMapOf<LiveLayerId, List<LayerPoint>>()
+    private val enabledLayers = mutableSetOf<LiveLayerId>()
+
+    private var cameraCenterLat = runCatching { map.camera.center.latitude }.getOrDefault(52.1)
+    private var cameraCenterLon = runCatching { map.camera.center.longitude }.getOrDefault(5.3)
+    private var cameraRangeMeters = runCatching { map.camera.range }.getOrDefault(2_000_000.0)
+    private var cameraResyncJob: Job? = null
+    @Volatile private var closed = false
+
+    init {
+        // Maps 3D individual markers are much heavier than Cesium's batched BillboardCollection.
+        // Rebuild the visible LOD only after camera movement settles, never on every frame.
+        map.addOnCameraMoveListener {
+            if (closed) return@addOnCameraMoveListener
+
+            val camera = runCatching { map.camera }.getOrNull() ?: return@addOnCameraMoveListener
+            cameraCenterLat = camera.center.latitude
+            cameraCenterLon = camera.center.longitude
+            cameraRangeMeters = camera.range
+
+            cameraResyncJob?.cancel()
+            cameraResyncJob = scope.launch {
+                delay(CAMERA_LOD_DEBOUNCE_MS)
+                enabledLayers.toList().forEach { renderLayerFromCache(it) }
+            }
+        }
+    }
 
     fun setEnabled(layer: LiveLayerId, enabled: Boolean) {
-        if (enabled) start(layer) else stop(layer)
+        if (enabled) {
+            enabledLayers += layer
+            start(layer)
+        } else {
+            enabledLayers -= layer
+            stop(layer)
+        }
     }
 
     fun close() {
+        closed = true
+        cameraResyncJob?.cancel()
         LiveLayerId.entries.forEach { stop(it) }
         scope.coroutineContext[Job]?.cancel()
     }
@@ -94,10 +130,14 @@ class LiveLayerController(
 
         jobs[layer] = scope.launch {
             while (isActive) {
-                onLayerState(layer, LayerUiState(
-                    loading = true,
-                    count = markers[layer]?.size ?: 0
-                ))
+                onLayerState(
+                    layer,
+                    LayerUiState(
+                        loading = true,
+                        count = markers[layer]?.size ?: 0,
+                        totalCount = latestPoints[layer]?.size ?: 0
+                    )
+                )
 
                 try {
                     val points = withContext(Dispatchers.IO) {
@@ -110,14 +150,15 @@ class LiveLayerController(
                         }
                     }
 
-                    syncMarkers(layer, points)
-                    onLayerState(layer, LayerUiState(count = points.size))
+                    latestPoints[layer] = points
+                    renderLayerFromCache(layer)
                 } catch (t: Throwable) {
                     val short = t.message?.take(90) ?: t.javaClass.simpleName
                     onLayerState(
                         layer,
                         LayerUiState(
                             count = markers[layer]?.size ?: 0,
+                            totalCount = latestPoints[layer]?.size ?: 0,
                             error = short
                         )
                     )
@@ -127,7 +168,7 @@ class LiveLayerController(
                 val interval = refreshInterval(layer)
                 while (isActive && waited < interval) {
                     delay(MOTION_TICK_MS)
-                    advanceMovingContacts(layer, MOTION_TICK_MS / 1000.0)
+                    advanceMovingContacts(layer)
                     waited += MOTION_TICK_MS
                 }
             }
@@ -139,7 +180,68 @@ class LiveLayerController(
         markers.remove(layer)?.values?.forEach { state ->
             runCatching { state.marker.remove() }
         }
-        onLayerState(layer, LayerUiState())
+        onLayerState(layer, LayerUiState(totalCount = latestPoints[layer]?.size ?: 0))
+    }
+
+    private fun renderLayerFromCache(layer: LiveLayerId) {
+        if (layer !in enabledLayers) return
+        val allPoints = latestPoints[layer] ?: return
+        val visible = selectForCamera(layer, allPoints)
+        syncMarkers(layer, visible)
+        onLayerState(
+            layer,
+            LayerUiState(
+                count = visible.size,
+                totalCount = allPoints.size
+            )
+        )
+    }
+
+    private fun selectForCamera(layer: LiveLayerId, points: List<LayerPoint>): List<LayerPoint> {
+        if (layer == LiveLayerId.ISS || layer == LiveLayerId.LAUNCHES) return points
+
+        val cap = markerCap(layer, cameraRangeMeters)
+        if (points.size <= cap) return points
+
+        // Keep the nearest contacts to the current camera center. This is the native
+        // Maps 3D LOD equivalent of the upstream Cesium billboard batching strategy.
+        return points
+            .asSequence()
+            .sortedBy { approximateAngularDistanceSq(it.latitude, it.longitude) }
+            .take(cap)
+            .toList()
+    }
+
+    private fun markerCap(layer: LiveLayerId, rangeMeters: Double): Int {
+        val far = rangeMeters > 3_500_000.0
+        val medium = rangeMeters > 1_500_000.0
+
+        return when (layer) {
+            LiveLayerId.FLIGHTS -> when {
+                far -> 55
+                medium -> 85
+                else -> 125
+            }
+            LiveLayerId.MILITARY -> when {
+                far -> 20
+                medium -> 30
+                else -> 45
+            }
+            LiveLayerId.EARTHQUAKES -> when {
+                far -> 35
+                medium -> 55
+                else -> 80
+            }
+            LiveLayerId.ISS -> 1
+            LiveLayerId.LAUNCHES -> 16
+        }
+    }
+
+    private fun approximateAngularDistanceSq(lat: Double, lon: Double): Double {
+        val dLat = Math.toRadians(lat - cameraCenterLat)
+        val dLon = Math.toRadians(lon - cameraCenterLon) *
+            cos(Math.toRadians(cameraCenterLat))
+        return dLat * dLat + dLon * dLon
     }
 
     private fun syncMarkers(layer: LiveLayerId, points: List<LayerPoint>) {
@@ -170,31 +272,18 @@ class LiveLayerController(
             val desiredBucket = headingBucketFor(layer, correctedPoint.trackDegrees)
 
             if (existing != null) {
-                // A plane should visibly point along its reported true track.
-                // Recreate only when it crosses a 22.5-degree bucket, not every motion tick.
-                if (desiredBucket != null && desiredBucket != existing.headingBucket) {
-                    runCatching { existing.marker.remove() }
-                    val replacement = createMarker(layer, correctedPoint) ?: return@forEach
-
-                    existing.marker = replacement
-                    existing.headingBucket = desiredBucket
-                    existing.point = correctedPoint
-                    existing.renderLat = correctedPoint.latitude
-                    existing.renderLon = correctedPoint.longitude
-                    existing.renderAltitudeMeters = correctedPoint.altitudeMeters
-
-                    bindClickListener(layer, correctedPoint.id, replacement, correctedPoint)
-                    updateMarkerPosition(existing)
-                } else {
-                    existing.point = correctedPoint
-
-                    // Fresh telemetry is authoritative. Snap back to the newest fix, then
-                    // continue dead-reckoning at 4 Hz until the next network update.
-                    existing.renderLat = correctedPoint.latitude
-                    existing.renderLon = correctedPoint.longitude
-                    existing.renderAltitudeMeters = correctedPoint.altitudeMeters
-                    updateMarkerPosition(existing)
+                // Camera-only LOD resync? Keep the dead-reckoned render position.
+                if (existing.point == correctedPoint && desiredBucket == existing.headingBucket) {
+                    return@forEach
                 }
+
+                existing.point = correctedPoint
+                existing.headingBucket = desiredBucket
+                existing.renderLat = correctedPoint.latitude
+                existing.renderLon = correctedPoint.longitude
+                existing.renderAltitudeMeters = correctedPoint.altitudeMeters
+
+                upsertMarker(layer, existing)
             } else {
                 val marker = createMarker(layer, correctedPoint) ?: return@forEach
                 val state = LiveMarkerState(
@@ -232,28 +321,62 @@ class LiveLayerController(
     }
 
     private fun createMarker(layer: LiveLayerId, point: LayerPoint): Marker? =
+        addOrUpdateMarker(
+            layer = layer,
+            point = point,
+            latitude = point.latitude,
+            longitude = point.longitude,
+            altitudeMeters = point.altitudeMeters,
+            overrideId = null
+        )
+
+    private fun addOrUpdateMarker(
+        layer: LiveLayerId,
+        point: LayerPoint,
+        latitude: Double,
+        longitude: Double,
+        altitudeMeters: Double,
+        overrideId: String?,
+    ): Marker? =
         map.addMarker(
             markerOptions {
-                id = "${layer.name}:${point.id}"
+                id = overrideId ?: "${layer.name}:${point.id}"
                 position = latLngAltitude {
-                    latitude = point.latitude
-                    longitude = point.longitude
-                    altitude = point.altitudeMeters
+                    this.latitude = latitude
+                    this.longitude = longitude
+                    altitude = altitudeMeters
                 }
 
-                // The old build labelled every single plane, turning Europe into alphabet soup.
-                // Only unique low-density contacts get a permanent label.
                 if (layer == LiveLayerId.ISS) {
                     label = point.label
                 }
 
                 altitudeMode = point.altitudeMode
                 isExtruded = false
-                isDrawnWhenOccluded = true
+
+                // Never force the far side of Earth to render hundreds of contacts.
+                // The upstream web app also has a horizon occluder for this reason.
+                isDrawnWhenOccluded = false
                 collisionBehavior = CollisionBehavior.OPTIONAL_AND_HIDES_LOWER_PRIORITY
                 setStyle(ImageView(iconFor(layer, point.trackDegrees)))
             }
         )
+
+    private fun upsertMarker(layer: LiveLayerId, state: LiveMarkerState) {
+        // Maps 3D objects are largely immutable. Google's own Compose helper updates
+        // markers by calling addMarker again with the SAME underlying ID.
+        val updated = addOrUpdateMarker(
+            layer = layer,
+            point = state.point,
+            latitude = state.renderLat,
+            longitude = state.renderLon,
+            altitudeMeters = state.renderAltitudeMeters,
+            overrideId = state.marker.id
+        ) ?: return
+
+        state.marker = updated
+        bindClickListener(layer, state.point.id, updated, state.point)
+    }
 
     private fun iconFor(layer: LiveLayerId, trackDegrees: Double?): Int = when (layer) {
         LiveLayerId.FLIGHTS -> aircraftIcon(headingBucket(trackDegrees) ?: 0, military = false)
@@ -317,12 +440,14 @@ class LiveLayerController(
             }
         }
 
-    private fun advanceMovingContacts(layer: LiveLayerId, dtSeconds: Double) {
+    private fun advanceMovingContacts(layer: LiveLayerId) {
         if (layer != LiveLayerId.FLIGHTS &&
             layer != LiveLayerId.MILITARY &&
             layer != LiveLayerId.ISS
         ) return
 
+        // The SDK's native Marker API is not a batched sprite collection.
+        // One real position update per second per visible contact keeps touch/zoom fluid.
         markers[layer]?.values?.forEach { state ->
             val point = state.point
             if (!point.moving) return@forEach
@@ -332,27 +457,21 @@ class LiveLayerController(
             if (speed <= 0.5 || !speed.isFinite() || !track.isFinite()) return@forEach
 
             val maxSpeedMps = if (layer == LiveLayerId.ISS) 9_000.0 else 1_200.0
-            val distance = speed.coerceAtMost(maxSpeedMps) * dtSeconds
+            val distance = speed.coerceAtMost(maxSpeedMps) * (MOTION_TICK_MS / 1000.0)
             val moved = destinationPoint(
                 state.renderLat,
                 state.renderLon,
                 track,
                 distance
             )
+
             state.renderLat = moved.first
             state.renderLon = moved.second
-            updateMarkerPosition(state)
-        }
-    }
 
-    private fun updateMarkerPosition(state: LiveMarkerState) {
-        state.marker.setPosition(
-            latLngAltitude {
-                latitude = state.renderLat
-                longitude = state.renderLon
-                altitude = state.renderAltitudeMeters
-            }
-        )
+            // Important: setPosition() compiles in 0.2.2 but does not reliably invalidate
+            // the rendered marker. Same-ID addMarker is the SDK-supported upsert path.
+            upsertMarker(layer, state)
+        }
     }
 
     private fun refreshInterval(layer: LiveLayerId): Long = when (layer) {
@@ -405,7 +524,8 @@ class LiveLayerController(
     }
 
     companion object {
-        private const val MOTION_TICK_MS = 250L
+        private const val MOTION_TICK_MS = 1_000L
+        private const val CAMERA_LOD_DEBOUNCE_MS = 450L
         private const val EARTH_RADIUS_M = 6_371_000.0
     }
 }

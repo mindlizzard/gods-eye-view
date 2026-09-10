@@ -292,7 +292,14 @@ private fun LayerPanel(
                             when {
                                 state.error != null -> state.error
                                 state.loading -> "laden…"
-                                state.count > 0 -> "${state.count} contacten · ${layer.source}"
+                                state.count > 0 -> {
+                                    val total = state.totalCount
+                                    if (total > state.count) {
+                                        "${state.count} van $total zichtbaar · ${layer.source}"
+                                    } else {
+                                        "${state.count} contacten · ${layer.source}"
+                                    }
+                                }
                                 else -> layer.source
                             },
                             style = MaterialTheme.typography.bodySmall,
