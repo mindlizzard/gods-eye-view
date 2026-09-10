@@ -4,6 +4,20 @@ plugins {
     alias(libs.plugins.secrets.gradle.plugin)
 }
 
+val stableKeystorePath = System.getenv("GODSEYE_KEYSTORE_PATH")
+val stableKeystorePassword = System.getenv("GODSEYE_KEYSTORE_PASSWORD")
+val stableKeyAlias = System.getenv("GODSEYE_KEY_ALIAS")
+val stableKeyPassword = System.getenv("GODSEYE_KEY_PASSWORD")
+
+val stableSigningAvailable = listOf(
+    stableKeystorePath,
+    stableKeystorePassword,
+    stableKeyAlias,
+    stableKeyPassword
+).all { !it.isNullOrBlank() }
+
+val ciVersionCode = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 1
+
 android {
     namespace = "com.mindlizzard.godseye"
     compileSdk = libs.versions.compileSdk.get().toInt()
@@ -12,11 +26,28 @@ android {
         applicationId = "com.mindlizzard.godseye"
         minSdk = libs.versions.minSdk.get().toInt()
         targetSdk = libs.versions.targetSdk.get().toInt()
-        versionCode = 1
-        versionName = "0.1.0-native"
+        versionCode = ciVersionCode
+        versionName = "0.2.$ciVersionCode-native"
+    }
+
+    signingConfigs {
+        if (stableSigningAvailable) {
+            create("stableDebug") {
+                storeFile = rootProject.file(stableKeystorePath!!)
+                storePassword = stableKeystorePassword
+                keyAlias = stableKeyAlias
+                keyPassword = stableKeyPassword
+            }
+        }
     }
 
     buildTypes {
+        debug {
+            if (stableSigningAvailable) {
+                signingConfig = signingConfigs.getByName("stableDebug")
+            }
+        }
+
         release {
             isMinifyEnabled = false
             proguardFiles(

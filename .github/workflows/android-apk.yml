@@ -38,8 +38,24 @@ jobs:
         env:
           MAPS3D_API_KEY: ${{ secrets.MAPS3D_API_KEY }}
 
+      - name: Restore stable Android signing key
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+        run: |
+          if [ -z "${ANDROID_KEYSTORE_B64:-}" ]; then
+            echo "::error::ANDROID_KEYSTORE_B64 is missing. Run scripts/setup-android-stable-signing.sh once."
+            exit 1
+          fi
+          printf '%s' "$ANDROID_KEYSTORE_B64" | base64 --decode > android/godseye-signing.jks
+
       - name: Build debug APK
         working-directory: android
+        env:
+          GODSEYE_KEYSTORE_PATH: godseye-signing.jks
+          GODSEYE_KEYSTORE_PASSWORD: ${{ secrets.GODSEYE_KEYSTORE_PASSWORD }}
+          GODSEYE_KEY_ALIAS: ${{ secrets.GODSEYE_KEY_ALIAS }}
+          GODSEYE_KEY_PASSWORD: ${{ secrets.GODSEYE_KEY_PASSWORD }}
         run: gradle --no-daemon :app:assembleDebug
 
       - name: Upload APK
