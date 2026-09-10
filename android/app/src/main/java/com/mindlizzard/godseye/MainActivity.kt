@@ -31,6 +31,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -74,6 +75,7 @@ private fun GodsEyeScreen() {
     var map3D by remember { mutableStateOf<GoogleMap3D?>(null) }
     var showLayers by remember { mutableStateOf(false) }
     var selected by remember { mutableStateOf<SelectedContact?>(null) }
+    var mapGeneration by remember { mutableStateOf(0) }
 
     val enabled = remember {
         mutableStateMapOf(
@@ -113,18 +115,20 @@ private fun GodsEyeScreen() {
     }
 
     Box(modifier = Modifier.fillMaxSize()) {
-        Map3DHost(
-            modifier = Modifier.fillMaxSize(),
-            onReady = {
-                mapReady = true
-                mapError = null
-                map3D = it
-            },
-            onError = { error ->
-                mapReady = false
-                mapError = error.message ?: error.javaClass.simpleName
-            }
-        )
+        key(mapGeneration) {
+            Map3DHost(
+                modifier = Modifier.fillMaxSize(),
+                onReady = {
+                    mapReady = true
+                    mapError = null
+                    map3D = it
+                },
+                onError = { error ->
+                    mapReady = false
+                    mapError = error.message ?: error.javaClass.simpleName
+                }
+            )
+        }
 
         Card(
             modifier = Modifier
@@ -186,7 +190,15 @@ private fun GodsEyeScreen() {
             horizontalArrangement = Arrangement.spacedBy(17.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            BottomChip("3D")
+            BottomChip("3D ↻") {
+                // Maps 3D 0.2.2 is Experimental Preview. If its camera renderer gets
+                // wedged, recreate the native view rather than leaving the user stuck.
+                mapReady = false
+                mapError = null
+                selected = null
+                map3D = null
+                mapGeneration += 1
+            }
             BottomChip("LAYERS") { showLayers = !showLayers }
             BottomChip("UAP") { showLayers = true }
             BottomChip(
@@ -413,9 +425,9 @@ private fun Map3DHost(
             heading = 0.0,
             tilt = 55.0,
             roll = 0.0,
-            range = 2_000_000.0,
+            range = 1_000_000.0,
             minAltitude = 0.0,
-            maxAltitude = 10_000_000.0,
+            maxAltitude = 1_000_000.0,
             minHeading = 0.0,
             maxHeading = 360.0,
             minTilt = 0.0,
